@@ -3,6 +3,7 @@ import os
 import shutil
 import time
 
+import py3nvml
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -14,19 +15,24 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from tensorboardX import SummaryWriter
 
-model_names = sorted(name for name in models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(models.__dict__[name]))
+import models as mymodels
+
+model_names = sorted(
+    name for name in models.__dict__
+    if name.islower() and not name.startswith("__") and
+    callable(models.__dict__[name]))
+mymodel_names = [m for m in mymodels.__all__]
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR',
                     help='path to dataset')
 parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet18',
-                    choices=model_names,
+                    choices=model_names+mymodel_names,
                     help='model architecture: ' +
-                        ' | '.join(model_names) +
-                        ' (default: resnet18)')
+                         ' | '.join(model_names) +
+                         ' (default: resnet18)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
@@ -35,6 +41,9 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
+parser.add_argument('--iter-size', default=1, type=int,
+                    help='mini-batch iterations between update steps. useful ' +
+                    'for accumulating gradients.')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
@@ -55,6 +64,10 @@ parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='gloo', type=str,
                     help='distributed backend')
+parser.add_argument('--num-gpus', default=1, type=int,
+                    help='number of gpus to use')
+parser.add_argument('--outdir', default='.',
+                    help='The output directory to save checkpoints and logs')
 
 best_prec1 = 0
 
@@ -62,20 +75,26 @@ best_prec1 = 0
 def main():
     global args, best_prec1
     args = parser.parse_args()
+    py3nvml.grab_gpus(args.num_gpus, gpu_fraction=0.95)
 
     args.distributed = args.world_size > 1
 
     if args.distributed:
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+        dist.init_process_group(backend=args.dist_backend,
+                                init_method=args.dist_url,
                                 world_size=args.world_size)
 
     # create model
-    if args.pretrained:
-        print("=> using pre-trained model '{}'".format(args.arch))
-        model = models.__dict__[args.arch](pretrained=True)
-    else:
-        print("=> creating model '{}'".format(args.arch))
-        model = models.__dict__[args.arch]()
+    if args.arch in models.__dict__.keys():
+        if args.pretrained:
+            print("=> using pre-trained model '{}'".format(args.arch))
+            model = models.__dict__[args.arch](pretrained=True)
+        else:
+            print("=> creating model '{}'".format(args.arch))
+            model = models.__dict__[args.arch]()
+    elif args.arch in mymodels.__dict__.keys():
+        # Try create from local models
+        model = mymodels.__dict__[args.arch](args.pretrained)
 
     if not args.distributed:
         if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
@@ -90,9 +109,11 @@ def main():
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+    optimizer = torch.optim.SGD(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -116,24 +137,6 @@ def main():
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
-
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    else:
-        train_sampler = None
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
             transforms.Resize(256),
@@ -148,16 +151,40 @@ def main():
         validate(val_loader, model, criterion)
         return
 
+    train_dataset = datasets.ImageFolder(
+        traindir,
+        transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ]))
+
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset)
+    else:
+        train_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.batch_size//args.iter_size,
+        shuffle=(train_sampler is None), num_workers=args.workers,
+        pin_memory=True, sampler=train_sampler)
+
+    #  train_writer = SummaryWriter(os.path.join(args.outdir, 'train'))
+    val_writer = SummaryWriter(os.path.join(args.outdir, 'val'))
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch)
+        train(train_loader, model, criterion, optimizer, epoch, args.iter_size)
 
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion)
+        prec1, prec5 = validate(val_loader, model, criterion)
+        val_writer.add_scalar('prec1', prec1, epoch)
+        val_writer.add_scalar('prec5', prec5, epoch)
 
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
@@ -167,11 +194,11 @@ def main():
             'arch': args.arch,
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
-            'optimizer' : optimizer.state_dict(),
-        }, is_best)
+            'optimizer': optimizer.state_dict(),
+        }, is_best, args.outdir)
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch, iter_size):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -199,9 +226,24 @@ def train(train_loader, model, criterion, optimizer, epoch):
         top5.update(prec5[0], input.size(0))
 
         # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if i % iter_size == 0:
+            optimizer.zero_grad()
+            N = 0
+
+        # Get the minibatch size
+        n = target.shape[0]
+        # Calculate n * average loss (i.e. sum of losses)
+        loss.backward(torch.tensor(n, dtype=torch.float32).cuda())
+        #  loss.backward()
+        N += n
+
+        if (i + 1) % iter_size == 0:
+            # Divide by the full batch size
+            for p in model.parameters():
+                if p.requires_grad:
+                    p.grad /= N
+                #  p.grad /= iter_size
+            optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -214,8 +256,8 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5))
+                      epoch, i, len(train_loader), batch_time=batch_time,
+                      data_time=data_time, loss=losses, top1=top1, top5=top5))
 
 
 def validate(val_loader, model, criterion):
@@ -252,19 +294,21 @@ def validate(val_loader, model, criterion):
                       'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                       'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
                       'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                       i, len(val_loader), batch_time=batch_time, loss=losses,
-                       top1=top1, top5=top5))
+                          i, len(val_loader), batch_time=batch_time,
+                          loss=losses, top1=top1, top5=top5))
 
         print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
 
-    return top1.avg
+    return top1.avg, top5.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, outdir):
+    filename = os.path.join(outdir, 'checkpoint.pth.tar')
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        bestname = os.path.join(outdir, 'model_best.pth.tar')
+        shutil.copyfile(filename, bestname)
 
 
 class AverageMeter(object):
